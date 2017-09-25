@@ -3,19 +3,40 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 )
 
 func handleConfigRequest(resp http.ResponseWriter, req *http.Request, config *Config) {
 	if req.Method == "GET" {
 		json.NewEncoder(resp).Encode(config)
-	} else if req.Method == "POST" {
-		json.NewDecoder(req.Body).Decode(config)
-		config.Load()
+		return
 	}
+
+	if req.Method == "POST" {
+		json.NewDecoder(req.Body).Decode(config)
+		err := config.Load()
+		if err != nil {
+			panic(fmt.Errorf("%s for %s %s", err, req.Method, req.RequestURI))
+		}
+		return
+	}
+
+	if req.Method == "DELETE" {
+		err := config.Reset()
+		if err != nil {
+			panic(fmt.Errorf("%s for %s %s", err, req.Method, req.RequestURI))
+		}
+		return
+	}
+
+	resp.WriteHeader(405)
+	fmt.Fprintf(resp, "BetaMax: method %s is not allowed.\n", req.Method)
 }
 
 func configHandler(handler http.Handler, config *Config) http.Handler {
@@ -30,20 +51,39 @@ func configHandler(handler http.Handler, config *Config) http.Handler {
 
 func cassetteHandler(handler http.Handler, config *Config) http.Handler {
 	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		msg := ""
+
+		defer func(start time.Time) {
+			log.Printf("%s: [%s]\n", msg, time.Now().UTC().Sub(start))
+		}(time.Now().UTC())
+
 		if config.Cassette == "" {
+			msg = fmt.Sprintf("passthrough: %s %s", req.Method, req.URL)
 			handler.ServeHTTP(resp, req)
 			return
 		}
 
-		if episode := findEpisode(req, config); config.RecordNewEpisodes && episode != nil {
+		if episode := findEpisode(req, config); episode != nil {
+			msg = fmt.Sprintf("%s > replaying: %s %s", config.Cassette, req.Method, req.URL)
 			serveEpisode(episode, resp)
-		} else {
-			if !config.DenyUnrecordedRequests {
-				serveAndRecord(resp, req, handler, config)
-			} else {
-				resp.WriteHeader(403)
-			}
+			return
 		}
+
+		if config.RecordNewEpisodes {
+			msg = fmt.Sprintf("%s > recording: %s %s", config.Cassette, req.Method, req.URL)
+			serveAndRecord(resp, req, handler, config)
+			return
+		}
+
+		if config.DenyUnrecordedRequests {
+			msg = fmt.Sprintf("%s > missed: %s %s", config.Cassette, req.Method, req.URL)
+			resp.WriteHeader(499)
+			fmt.Fprintf(resp, "BetaMax: request not recorded, neither requested.\n")
+			return
+		}
+
+		msg = fmt.Sprintf("%s > passthrough: %s %s", config.Cassette, req.Method, req.URL)
+		handler.ServeHTTP(resp, req)
 	})
 }
 
@@ -54,6 +94,19 @@ func rewriteHeaderHandler(handler http.Handler, config *Config) http.Handler {
 		}
 
 		handler.ServeHTTP(resp, req)
+	})
+}
+
+func recoverHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("Error: %s\n", err)
+				http.Error(w, err.(error).Error(), 500)
+			}
+		}()
+
+		h.ServeHTTP(w, r)
 	})
 }
 
@@ -177,10 +230,35 @@ func serveEpisode(episode *Episode, resp http.ResponseWriter) {
 	resp.Write(episode.Response.Body)
 }
 
-func Proxy(target *url.URL, cassetteDir string) http.Handler {
+func Proxy(source *url.URL, target *url.URL, cassetteDir string) http.Handler {
 	config := &Config{CassetteDir: cassetteDir, RecordNewEpisodes: true, RewriteHostHeader: true, TargetHost: target.Host}
 
-	cassetteHandler := cassetteHandler(httputil.NewSingleHostReverseProxy(target), config)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ModifyResponse = func(resp *http.Response) (err error) {
+		/*
+			b, err := ioutil.ReadAll(resp.Body) //Read html
+			if err != nil {
+				return err
+			}
+			err = resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			b = bytes.Replace(b, []byte(target.Host), []byte(source.Host), -1) // replace html
+			body := ioutil.NopCloser(bytes.NewReader(b))
+			resp.Body = body
+			resp.ContentLength = int64(len(b))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(b)))
+
+			if location := resp.Header.Get("Location"); location != "" {
+				resp.Header.Set("Location", strings.Replace(location, target.Host, source.Host, -1))
+			}
+		*/
+		return nil
+	}
+
+	cassetteHandler := cassetteHandler(proxy, config)
 	rewriteHeaderHandler := rewriteHeaderHandler(cassetteHandler, config)
-	return configHandler(rewriteHeaderHandler, config)
+	configHandler := configHandler(rewriteHeaderHandler, config)
+	return recoverHandler(configHandler)
 }

@@ -3,7 +3,9 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -124,6 +126,10 @@ func episodes(writeableEpisodes []WriteableEpisode) []Episode {
 	return episodes
 }
 
+func (c *Config) CassetteFile() string {
+	return path.Join(c.CassetteDir, c.Cassette+".json")
+}
+
 func (c *Config) Save() error {
 	episodes := writeableEpisodes(c.Episodes)
 
@@ -132,18 +138,56 @@ func (c *Config) Save() error {
 		return err
 	}
 	os.MkdirAll(c.CassetteDir, 0700)
-	return ioutil.WriteFile(path.Join(c.CassetteDir, c.Cassette+".json"), jsonData, 0700)
+	return ioutil.WriteFile(c.CassetteFile(), jsonData, 0700)
 }
 
 func (c *Config) Load() error {
+	if c.Cassette == "" {
+		c.Episodes = []Episode{}
+		c.RecordNewEpisodes = true
+		c.RewriteHostHeader = true
+		c.DenyUnrecordedRequests = false
+		log.Printf("No cassette in the tray\n")
+		return nil
+	}
 
-	cassetteData, err := ioutil.ReadFile(path.Join(c.CassetteDir, c.Cassette+".json"))
+	file := c.CassetteFile()
+
+	if _, err := os.Stat(file); os.IsNotExist(err) {
+		c.Episodes = []Episode{}
+		log.Printf("New cassette {%s} loaded: %d episodes, recording: %v, isolated: %v\n", c.Cassette, len(c.Episodes), c.RecordNewEpisodes, c.DenyUnrecordedRequests)
+		return nil
+	}
+
+	cassetteData, err := ioutil.ReadFile(file)
+
 	if err != nil {
 		c.Episodes = []Episode{}
 		return err
 	}
+
 	writableEpisodes := []WriteableEpisode{}
 	err = json.Unmarshal(cassetteData, &writableEpisodes)
 	c.Episodes = episodes(writableEpisodes)
+
+	log.Printf("Cassette {%s} loaded: %d episodes, recording: %v, isolated: %v\n", c.Cassette, len(c.Episodes), c.RecordNewEpisodes, c.DenyUnrecordedRequests)
 	return err
+}
+
+func (c *Config) Reset() error {
+	if c.Cassette == "" {
+		return fmt.Errorf("Cassete is not inserted")
+	}
+
+	log.Printf("Cassette {%s} erased\n", c.Cassette)
+
+	file := c.CassetteFile()
+
+	c.Episodes = []Episode{}
+
+	if _, err := os.Stat(file); os.IsNotExist(err) {
+		return nil
+	}
+
+	return os.Remove(file)
 }
